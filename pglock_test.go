@@ -13,7 +13,7 @@ import (
 
 const (
 	lockID         = "lock-id"
-	defaultTimeout = 10 * time.Millisecond
+	defaultTimeout = 50 * time.Millisecond
 )
 
 var (
@@ -47,8 +47,12 @@ func TestLockSucceed(t *testing.T) {
 		}
 		locked <- true
 		times <- time.Now()
-		time.Sleep(5 * time.Millisecond)
+
+		time.Sleep(defaultTimeout / 2)
+
+		assert.True(t, l.IsLocked())
 		l.Unlock(defaultTimeout)
+		assert.False(t, l.IsLocked())
 	}()
 
 	if <-locked {
@@ -60,7 +64,10 @@ func TestLockSucceed(t *testing.T) {
 				t.Fatal(err)
 			}
 			times <- time.Now()
+
+			assert.True(t, l.IsLocked())
 			l.Unlock(defaultTimeout)
+			assert.False(t, l.IsLocked())
 			done <- true
 		}()
 	} else {
@@ -72,7 +79,7 @@ func TestLockSucceed(t *testing.T) {
 		t1 := <-times
 		t2 := <-times
 
-		assert.WithinDuration(t, t1, t2, 10*time.Millisecond)
+		assert.WithinDuration(t, t1, t2, defaultTimeout)
 	}
 }
 
@@ -88,7 +95,10 @@ func TestLockTimeout(t *testing.T) {
 			t.Fatal()
 		}
 		locked <- true
+		assert.True(t, l.IsLocked())
+
 		time.Sleep(2 * defaultTimeout)
+
 		err = l.Unlock(defaultTimeout)
 		assert.NoError(t, err)
 		done <- true
@@ -99,6 +109,7 @@ func TestLockTimeout(t *testing.T) {
 			l := getLock(t, testDB)
 			err := l.Lock(defaultTimeout)
 			assert.EqualError(t, err, "Timed out")
+			assert.False(t, l.IsLocked())
 			done <- true
 		}()
 	} else {
@@ -117,6 +128,7 @@ func TestAlreadyLockedError(t *testing.T) {
 		defer l.Unlock(defaultTimeout)
 		err = l.Lock(defaultTimeout)
 		assert.EqualError(t, err, "Already locked")
+		assert.True(t, l.IsLocked())
 	}
 }
 
@@ -128,6 +140,73 @@ func TestNotLockedError(t *testing.T) {
 		assert.NoError(t, err)
 		err = l.Unlock(defaultTimeout)
 		assert.EqualError(t, err, "Not locked")
+		assert.False(t, l.IsLocked())
+	}
+}
+
+func TestTryLockSucceed(t *testing.T) {
+	locked := make(chan bool)
+	done := make(chan bool)
+	times := make(chan time.Time, 2)
+
+	go func() {
+		l := getLock(t, testDB)
+		err := l.Lock(defaultTimeout)
+		if err != nil {
+			locked <- false
+			t.Fatal()
+		}
+		locked <- true
+		times <- time.Now()
+
+		time.Sleep(defaultTimeout / 2)
+
+		assert.True(t, l.IsLocked())
+		l.Unlock(defaultTimeout)
+		assert.False(t, l.IsLocked())
+	}()
+
+	if <-locked {
+		go func() {
+			l := getLock(t, testDB)
+			locked, err := l.TryLock(defaultTimeout)
+			if err != nil {
+				done <- false
+				t.Fatal(err)
+			}
+			if assert.False(t, locked) {
+				assert.False(t, l.IsLocked())
+
+				time.Sleep(defaultTimeout)
+
+				locked, err = l.TryLock(defaultTimeout)
+				if err != nil {
+					done <- false
+					t.Fatal(err)
+				}
+				if assert.True(t, locked) {
+					times <- time.Now()
+					assert.True(t, l.IsLocked())
+					l.Unlock(defaultTimeout)
+					assert.False(t, l.IsLocked())
+					done <- true
+				} else {
+					done <- false
+				}
+			} else {
+				done <- false
+			}
+		}()
+	} else {
+		t.Error("Not locked by the first goroutine")
+		return
+	}
+
+	if <-done {
+		t1 := <-times
+		t2 := <-times
+
+		assert.WithinDuration(t, t1, t2, time.Duration(float64(defaultTimeout)*1.5))
 	}
 }
 
@@ -140,6 +219,7 @@ func TestTryLockReturns(t *testing.T) {
 		locked, err := l2.TryLock(defaultTimeout)
 		assert.False(t, locked)
 		assert.NoError(t, err)
+		assert.False(t, l2.IsLocked())
 	}
 }
 
