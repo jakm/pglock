@@ -157,12 +157,6 @@ func (l *AdvisoryLock) Unlock(timeout time.Duration) (err error) {
 		return ErrNotLocked
 	}
 
-	defer func() {
-		l.conn.Close()
-		l.conn = nil
-		l.pgLocked = false
-	}()
-
 	ctx, cancel := getContext(deadline)
 	defer cancel()
 
@@ -173,6 +167,10 @@ func (l *AdvisoryLock) Unlock(timeout time.Duration) (err error) {
 		}
 		return
 	}
+
+	l.conn.Close()
+	l.conn = nil
+	l.pgLocked = false
 
 	return nil
 }
