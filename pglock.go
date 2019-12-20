@@ -106,7 +106,7 @@ func (l *AdvisoryLock) lock(timeout time.Duration, blocking bool) (success bool,
 		if err != nil {
 			return
 		}
-		_, err = l.conn.ExecContext(ctx, `SELECT pg_advisory_lock($1)`, l.id)
+		_, err = tx.ExecContext(ctx, `SELECT pg_advisory_lock($1)`, l.id)
 		if err == nil {
 			l.pgLocked = true
 			err = tx.Commit()
