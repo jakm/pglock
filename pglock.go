@@ -14,9 +14,9 @@ import (
 const salt = "9ad09a3a30492944c3b62687101ca58e"
 
 var (
-	ErrAlreadyLocked  = errors.New("Already locked")
-	ErrAlreadyUnocked = errors.New("Already unlocked")
-	ErrTimeout        = errors.New("Timed out")
+	ErrAlreadyLocked = errors.New("Already locked")
+	ErrNotLocked     = errors.New("Not locked")
+	ErrTimeout       = errors.New("Timed out")
 )
 
 type AdvisoryLock struct {
@@ -54,12 +54,21 @@ func (l *AdvisoryLock) Lock(timeout time.Duration) error {
 }
 
 func (l *AdvisoryLock) lock(timeout time.Duration, blocking bool) (success bool, err error) {
+	defer func() {
+		if err == context.DeadlineExceeded {
+			err = ErrTimeout
+		}
+	}()
+
 	deadline := time.Now().Add(timeout)
 
 	if blocking {
-		l.mutex.Lock()
-	} else {
 		locked := l.mutex.TryLock(timeout)
+		if !locked {
+			return false, ErrTimeout
+		}
+	} else {
+		locked := l.mutex.TryLock(0)
 		if !locked {
 			return
 		}
@@ -70,11 +79,7 @@ func (l *AdvisoryLock) lock(timeout time.Duration, blocking bool) (success bool,
 		return false, ErrAlreadyLocked
 	}
 
-	if isTimeout(blocking, deadline) {
-		return false, ErrTimeout
-	}
-
-	ctx, cancel := getContext(blocking, deadline)
+	ctx, cancel := getContext(deadline)
 	defer cancel()
 
 	// make sure the same connection is used for both locking and unlocking
@@ -86,24 +91,26 @@ func (l *AdvisoryLock) lock(timeout time.Duration, blocking bool) (success bool,
 
 	if blocking {
 		var tx *sql.Tx
-		tx, err = l.conn.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+		tx, err = l.conn.BeginTx(ctx, nil)
 		if err != nil {
 			return
 		}
 		defer tx.Rollback()
-		_, err = tx.ExecContext(ctx, fmt.Sprintf(`SET LOCAL lock_timeout = '%s'`, deadline.Sub(time.Now())))
+		_, err = tx.ExecContext(ctx, fmt.Sprintf(`SET LOCAL lock_timeout = '%s'`, getPgLockTimeout(deadline)))
 		if err != nil {
-			return false, err
+			return
 		}
 		_, err = l.conn.ExecContext(ctx, `SELECT pg_advisory_lock($1)`, l.id)
+		if err == nil {
+			l.pgLocked = true
+			err = tx.Commit()
+		}
 		if err != nil {
 			if isLockNotAvailableError(err) {
 				return false, ErrTimeout
 			}
 			return
 		}
-		l.pgLocked = true
-		tx.Commit()
 	} else {
 		err = l.conn.QueryRowContext(ctx, `SELECT pg_try_advisory_lock($1)`, l.id).Scan(&l.pgLocked)
 		if err != nil {
@@ -117,26 +124,31 @@ func (l *AdvisoryLock) lock(timeout time.Duration, blocking bool) (success bool,
 	return l.pgLocked, nil
 }
 
-func (l *AdvisoryLock) Unlock(timeout time.Duration) error {
-	return l.unlock(timeout, false)
+func getPgLockTimeout(deadline time.Time) string {
+	d := deadline.Sub(time.Now())
+	if d < time.Millisecond {
+		return time.Millisecond.String()
+	}
+	return d.String()
 }
 
-func (l *AdvisoryLock) unlock(timeout time.Duration, blocking bool) error {
+func (l *AdvisoryLock) Unlock(timeout time.Duration) (err error) {
+	defer func() {
+		if err == context.DeadlineExceeded {
+			err = ErrTimeout
+		}
+	}()
+
 	deadline := time.Now().Add(timeout)
 
-	if blocking {
-		l.mutex.Lock()
-	} else {
-		l.mutex.TryLock(timeout)
+	locked := l.mutex.TryLock(timeout)
+	if !locked {
+		return ErrTimeout
 	}
 	defer l.mutex.Unlock()
 
 	if !l.pgLocked {
-		return ErrAlreadyUnocked
-	}
-
-	if isTimeout(blocking, deadline) {
-		return ErrTimeout
+		return ErrNotLocked
 	}
 
 	defer func() {
@@ -145,35 +157,22 @@ func (l *AdvisoryLock) unlock(timeout time.Duration, blocking bool) error {
 		l.pgLocked = false
 	}()
 
-	ctx, cancel := getContext(blocking, deadline)
+	ctx, cancel := getContext(deadline)
 	defer cancel()
 
-	_, err := l.conn.ExecContext(ctx, `SELECT pg_advisory_unlock($1)`, l.id)
+	_, err = l.conn.ExecContext(ctx, `SELECT pg_advisory_unlock($1)`, l.id)
 	if err != nil {
 		if isQueryCancelledError(err) {
-			return nil
+			return ErrTimeout
 		}
-		return err
+		return
 	}
 
 	return nil
 }
 
-func isTimeout(blocking bool, deadline time.Time) bool {
-	if !blocking {
-		t := time.Until(deadline)
-		if t <= 0 {
-			return true
-		}
-	}
-	return false
-}
-
-func getContext(blocking bool, deadline time.Time) (context.Context, context.CancelFunc) {
-	if !blocking {
-		return context.WithDeadline(context.Background(), deadline)
-	}
-	return context.Background(), func() {}
+func getContext(deadline time.Time) (context.Context, context.CancelFunc) {
+	return context.WithDeadline(context.Background(), deadline)
 }
 
 func isQueryCancelledError(err error) bool {

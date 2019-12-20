@@ -25,11 +25,7 @@ func TestMain(m *testing.M) {
 		panic("Empty POSTGRESQL_URL environment variable")
 	}
 
-	var err error
-	testDB, err = sql.Open("postgres", connStr)
-	if err != nil {
-		panic(err)
-	}
+	testDB = getDBConn()
 	defer testDB.Close()
 
 	os.Exit(m.Run())
@@ -122,14 +118,14 @@ func TestAlreadyLockedError(t *testing.T) {
 	}
 }
 
-func TestAlreadyUnlockedError(t *testing.T) {
+func TestNotLockedError(t *testing.T) {
 	l := getLock(t)
 	err := l.Lock(defaultTimeout)
 	if assert.NoError(t, err) {
 		err = l.Unlock(defaultTimeout)
 		assert.NoError(t, err)
 		err = l.Unlock(defaultTimeout)
-		assert.EqualError(t, err, "Already unlocked")
+		assert.EqualError(t, err, "Not locked")
 	}
 }
 
@@ -156,10 +152,7 @@ func TestUnlockTimeout(t *testing.T) {
 }
 
 func TestConcurrentConnections(t *testing.T) {
-	anotherConn, err := sql.Open("postgres", connStr)
-	if err != nil {
-		t.Fatal(err)
-	}
+	anotherConn := getDBConn()
 	defer anotherConn.Close()
 
 	l1 := getLock(t)
@@ -191,6 +184,37 @@ func TestConcurrentConnections(t *testing.T) {
 		err = l2.Unlock(defaultTimeout)
 		assert.NoError(t, err)
 	}
+}
+
+func TestConcurrentUnlockError(t *testing.T) {
+	anotherConn := getDBConn()
+	defer anotherConn.Close()
+
+	l1 := getLock(t)
+	err = l1.Lock(defaultTimeout)
+	if assert.NoError(t, err) {
+		defer func() {
+			if l1.IsLocked() {
+				l1.Unlock(defaultTimeout)
+			}
+		}()
+
+		l2, err := NewAdvisoryLock(anotherConn, lockID)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		err = l2.Unlock(defaultTimeout)
+		assert.EqualError(t, err, "Not locked")
+	}
+}
+
+func getDBConn() *sql.DB {
+	conn, err := sql.Open("postgres", connStr)
+	if err != nil {
+		panic(err)
+	}
+	return conn
 }
 
 func getLock(t *testing.T) *AdvisoryLock {
