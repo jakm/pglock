@@ -1,8 +1,10 @@
 package pglock
 
 import (
+	"context"
 	"database/sql"
-	_ "github.com/lib/pq"
+	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/lib/pq"
 	"github.com/stretchr/testify/assert"
 	"os"
 	"testing"
@@ -37,7 +39,7 @@ func TestLockSucceed(t *testing.T) {
 	times := make(chan time.Time, 2)
 
 	go func() {
-		l := getLock(t)
+		l := getLock(t, testDB)
 		err := l.Lock(defaultTimeout)
 		if err != nil {
 			locked <- false
@@ -51,7 +53,7 @@ func TestLockSucceed(t *testing.T) {
 
 	if <-locked {
 		go func() {
-			l := getLock(t)
+			l := getLock(t, testDB)
 			err := l.Lock(defaultTimeout)
 			if err != nil {
 				done <- false
@@ -79,7 +81,7 @@ func TestLockTimeout(t *testing.T) {
 	done := make(chan bool, 2)
 
 	go func() {
-		l := getLock(t)
+		l := getLock(t, testDB)
 		err := l.Lock(defaultTimeout)
 		if err != nil {
 			locked <- false
@@ -94,7 +96,7 @@ func TestLockTimeout(t *testing.T) {
 
 	if <-locked {
 		go func() {
-			l := getLock(t)
+			l := getLock(t, testDB)
 			err := l.Lock(defaultTimeout)
 			assert.EqualError(t, err, "Timed out")
 			done <- true
@@ -109,7 +111,7 @@ func TestLockTimeout(t *testing.T) {
 }
 
 func TestAlreadyLockedError(t *testing.T) {
-	l := getLock(t)
+	l := getLock(t, testDB)
 	err := l.Lock(defaultTimeout)
 	if assert.NoError(t, err) {
 		defer l.Unlock(defaultTimeout)
@@ -119,7 +121,7 @@ func TestAlreadyLockedError(t *testing.T) {
 }
 
 func TestNotLockedError(t *testing.T) {
-	l := getLock(t)
+	l := getLock(t, testDB)
 	err := l.Lock(defaultTimeout)
 	if assert.NoError(t, err) {
 		err = l.Unlock(defaultTimeout)
@@ -130,11 +132,11 @@ func TestNotLockedError(t *testing.T) {
 }
 
 func TestTryLockReturns(t *testing.T) {
-	l1 := getLock(t)
+	l1 := getLock(t, testDB)
 	err := l1.Lock(defaultTimeout)
 	if assert.NoError(t, err) {
 		defer l1.Unlock(defaultTimeout)
-		l2 := getLock(t)
+		l2 := getLock(t, testDB)
 		locked, err := l2.TryLock(defaultTimeout)
 		assert.False(t, locked)
 		assert.NoError(t, err)
@@ -142,12 +144,38 @@ func TestTryLockReturns(t *testing.T) {
 }
 
 func TestUnlockTimeout(t *testing.T) {
-	l := getLock(t)
-	err := l.Lock(defaultTimeout)
+	t.Run("DeadlineExceeded", func(t *testing.T) {
+		testUnlockTimeout(t, context.DeadlineExceeded)
+	})
+	t.Run("QueryCanceled", func(t *testing.T) {
+		testUnlockTimeout(t, &pq.Error{Code: "57014"})
+	})
+}
+
+func testUnlockTimeout(t *testing.T, returnedErr error) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	h, err := hashID(lockID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mock.ExpectQuery(`SELECT pg_try_advisory_lock`).WithArgs(h).WillReturnRows(sqlmock.NewRows([]string{"pg_try_advisory_lock"}).AddRow(true))
+	mock.ExpectExec(`SELECT pg_advisory_unlock`).WithArgs(h).WillReturnError(context.DeadlineExceeded)
+
+	l := getLock(t, db)
+	_, err = l.TryLock(defaultTimeout)
 	if assert.NoError(t, err) {
-		err = l.Unlock(0)
+		err = l.Unlock(defaultTimeout)
 		assert.EqualError(t, err, "Timed out")
-		l.Unlock(defaultTimeout)
+
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("there were unfulfilled expectations: %s", err)
+		}
 	}
 }
 
@@ -155,8 +183,8 @@ func TestConcurrentConnections(t *testing.T) {
 	anotherConn := getDBConn()
 	defer anotherConn.Close()
 
-	l1 := getLock(t)
-	err = l1.Lock(defaultTimeout)
+	l1 := getLock(t, testDB)
+	err := l1.Lock(defaultTimeout)
 	if assert.NoError(t, err) {
 		defer func() {
 			if l1.IsLocked() {
@@ -164,10 +192,7 @@ func TestConcurrentConnections(t *testing.T) {
 			}
 		}()
 
-		l2, err := NewAdvisoryLock(anotherConn, lockID)
-		if err != nil {
-			t.Fatal(err)
-		}
+		l2 := getLock(t, anotherConn)
 
 		err = l2.Lock(defaultTimeout)
 		assert.EqualError(t, err, "Timed out")
@@ -190,8 +215,8 @@ func TestConcurrentUnlockError(t *testing.T) {
 	anotherConn := getDBConn()
 	defer anotherConn.Close()
 
-	l1 := getLock(t)
-	err = l1.Lock(defaultTimeout)
+	l1 := getLock(t, testDB)
+	err := l1.Lock(defaultTimeout)
 	if assert.NoError(t, err) {
 		defer func() {
 			if l1.IsLocked() {
@@ -199,10 +224,7 @@ func TestConcurrentUnlockError(t *testing.T) {
 			}
 		}()
 
-		l2, err := NewAdvisoryLock(anotherConn, lockID)
-		if err != nil {
-			t.Fatal(err)
-		}
+		l2 := getLock(t, anotherConn)
 
 		err = l2.Unlock(defaultTimeout)
 		assert.EqualError(t, err, "Not locked")
@@ -217,8 +239,8 @@ func getDBConn() *sql.DB {
 	return conn
 }
 
-func getLock(t *testing.T) *AdvisoryLock {
-	l, err := NewAdvisoryLock(testDB, lockID)
+func getLock(t *testing.T, db *sql.DB) *AdvisoryLock {
+	l, err := NewAdvisoryLock(db, lockID)
 	if err != nil {
 		t.Fatal(err)
 	}

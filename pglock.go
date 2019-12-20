@@ -28,14 +28,20 @@ type AdvisoryLock struct {
 }
 
 func NewAdvisoryLock(db *sql.DB, id string) (*AdvisoryLock, error) {
-	h := fnv.New64()
-	_, err := h.Write([]byte(salt + id))
+	h, err := hashID(id)
 	if err != nil {
 		return nil, err
 	}
-	s := int(h.Sum64())
+	return &AdvisoryLock{db: db, id: h, mutex: trylock.New()}, nil
+}
 
-	return &AdvisoryLock{db: db, id: s, mutex: trylock.New()}, nil
+func hashID(id string) (int, error) {
+	h := fnv.New64()
+	_, err := h.Write([]byte(salt + id))
+	if err != nil {
+		return 0, err
+	}
+	return int(h.Sum64()), nil
 }
 
 func (l *AdvisoryLock) IsLocked() bool {
@@ -114,7 +120,7 @@ func (l *AdvisoryLock) lock(timeout time.Duration, blocking bool) (success bool,
 	} else {
 		err = l.conn.QueryRowContext(ctx, `SELECT pg_try_advisory_lock($1)`, l.id).Scan(&l.pgLocked)
 		if err != nil {
-			if isQueryCancelledError(err) {
+			if isQueryCanceledError(err) {
 				return false, ErrTimeout
 			}
 			return
@@ -162,7 +168,7 @@ func (l *AdvisoryLock) Unlock(timeout time.Duration) (err error) {
 
 	_, err = l.conn.ExecContext(ctx, `SELECT pg_advisory_unlock($1)`, l.id)
 	if err != nil {
-		if isQueryCancelledError(err) {
+		if isQueryCanceledError(err) {
 			return ErrTimeout
 		}
 		return
@@ -175,7 +181,7 @@ func getContext(deadline time.Time) (context.Context, context.CancelFunc) {
 	return context.WithDeadline(context.Background(), deadline)
 }
 
-func isQueryCancelledError(err error) bool {
+func isQueryCanceledError(err error) bool {
 	if err, ok := err.(*pq.Error); ok {
 		// 57014 is the postgres error code for canceled queries
 		if err.Code == "57014" {
