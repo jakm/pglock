@@ -130,6 +130,105 @@ func (l *AdvisoryLock) lock(timeout time.Duration, blocking bool) (success bool,
 	return l.pgLocked, nil
 }
 
+type TxFn func(tx *sql.Tx) error
+
+func (l *AdvisoryLock) TryLockTx(timeout time.Duration, txOpts *sql.TxOptions, fn TxFn) (bool, error) {
+	return l.lockTx(timeout, false, txOpts, fn)
+}
+
+func (l *AdvisoryLock) LockTx(timeout time.Duration, txOpts *sql.TxOptions, fn TxFn) error {
+	_, err := l.lockTx(timeout, true, txOpts, fn)
+	return err
+}
+
+func (l *AdvisoryLock) lockTx(timeout time.Duration, blocking bool, txOpts *sql.TxOptions, fn TxFn) (success bool, err error) {
+	var fnExecuted bool
+	var tx *sql.Tx
+
+	defer func() {
+		if p := recover(); p != nil {
+			// a panic occurred, rollback and repanic
+			if tx != nil {
+				tx.Rollback()
+			}
+			panic(p)
+		}
+		if err == context.DeadlineExceeded && !fnExecuted {
+			err = ErrTimeout
+		}
+		if tx != nil {
+			if err != nil {
+				tx.Rollback()
+			} else {
+				err = tx.Commit()
+			}
+		}
+	}()
+
+	deadline := time.Now().Add(timeout)
+
+	if blocking {
+		locked := l.mutex.TryLock(timeout)
+		if !locked {
+			return false, ErrTimeout
+		}
+	} else {
+		locked := l.mutex.TryLock(0)
+		if !locked {
+			return
+		}
+	}
+	defer l.mutex.Unlock()
+
+	if l.pgLocked {
+		return false, ErrAlreadyLocked
+	}
+
+	ctx, cancel := getContext(deadline)
+	defer cancel()
+
+	// make sure the same connection is used for both locking and unlocking
+	// https://engineering.qubecinema.com/2019/08/26/unlocking-advisory-locks.html
+	l.conn, err = l.db.Conn(ctx)
+	if err != nil {
+		return
+	}
+
+	tx, err = l.conn.BeginTx(ctx, txOpts)
+	if err != nil {
+		return
+	}
+	defer tx.Rollback()
+
+	if blocking {
+		_, err = tx.ExecContext(ctx, fmt.Sprintf(`SET LOCAL lock_timeout = '%s'`, getPgLockTimeout(deadline)))
+		if err != nil {
+			return
+		}
+		_, err = tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, l.id)
+		if err != nil {
+			if isLockNotAvailableError(err) {
+				return false, ErrTimeout
+			}
+			return
+		}
+		l.pgLocked = true
+	} else {
+		err = tx.QueryRowContext(ctx, `SELECT pg_try_advisory_xact_lock($1)`, l.id).Scan(&l.pgLocked)
+		if err != nil {
+			if isQueryCanceledError(err) {
+				return false, ErrTimeout
+			}
+			return
+		}
+	}
+
+	fnExecuted = true
+	err = fn(tx)
+
+	return l.pgLocked, err
+}
+
 func getPgLockTimeout(deadline time.Time) string {
 	d := deadline.Sub(time.Now())
 	if d < time.Millisecond {
